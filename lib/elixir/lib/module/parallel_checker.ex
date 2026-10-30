@@ -69,17 +69,25 @@ defmodule Module.ParallelChecker do
     # Protocols may have been consolidated. So if we know their beam location,
     # we discard their module map on purpose and start from file.
     if beam_location != [] and Keyword.has_key?(module_map.attributes, :__protocol__) do
-      spawn_and_register_cache(pid, checker, table, module, List.to_string(beam_location), log?)
+      spawn_and_register_cache(
+        pid,
+        checker,
+        table,
+        module,
+        List.to_string(beam_location),
+        log?,
+        true
+      )
     else
       {mode, module_tuple} = cache_from_module_map(table, module_map, signatures)
       ref = make_ref()
-      spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?)
+      spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?, true)
       register_cache_and_checker(checker, mode, module, spawned, ref)
       :ok
     end
   end
 
-  defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?) do
+  defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?) do
     spawn(fn ->
       mon_ref = Process.monitor(pid)
 
@@ -88,7 +96,7 @@ defmodule Module.ParallelChecker do
           # Set the compiler info so we can collect warnings
           Process.link(pid)
           :erlang.put(:elixir_compiler_info, {pid, self()})
-          {warnings, errors} = check_module(module_tuple, {checker, table}, log?, profile)
+          {warnings, errors} = check_module(module_tuple, {checker, table}, log?, types?, profile)
           send(pid, {__MODULE__, module, warnings, errors})
           send(checker, {__MODULE__, :checked, ref})
 
@@ -98,7 +106,7 @@ defmodule Module.ParallelChecker do
     end)
   end
 
-  defp spawn_and_register_cache(pid, checker, table, module, info, log?) do
+  defp spawn_and_register_cache(pid, checker, table, module, info, log?, types?) do
     ref = make_ref()
 
     spawned =
@@ -122,7 +130,10 @@ defmodule Module.ParallelChecker do
                  {@elixir_checker_version, contents} <- :erlang.binary_to_term(exck) do
               mode = cache_chunk(table, module, contents)
               module_tuple = module_map_to_module_tuple(module_map)
-              spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?)
+
+              spawned =
+                spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?)
+
               :ets.insert(table, {module, mode})
               send(checker, {__MODULE__, :cached, module, spawned, ref})
             else
@@ -191,8 +202,14 @@ defmodule Module.ParallelChecker do
     value = :erlang.get(:elixir_code_diagnostics)
     log? = not match?({_, false}, value)
 
-    for {module, file} <- runtime_files do
-      spawn_and_register_cache(self(), checker, table, module, file, log?)
+    for runtime_file <- runtime_files do
+      {module, file, types?} =
+        case runtime_file do
+          {module, file} -> {module, file, true}
+          {module, file, types?} -> {module, file, types?}
+        end
+
+      spawn_and_register_cache(self(), checker, table, module, file, log?, types?)
     end
 
     count = :gen_server.call(checker, :start, :infinity)
@@ -263,7 +280,7 @@ defmodule Module.ParallelChecker do
 
   ## Module checking
 
-  defp check_module(module_tuple, cache, log?, profile) do
+  defp check_module(module_tuple, cache, log?, types?, profile) do
     {module, file, line, definitions, no_warn_undefined, behaviours, impls, attrs, after_verify} =
       module_tuple
 
@@ -277,10 +294,15 @@ defmodule Module.ParallelChecker do
         definitions
       )
 
+    # Callers reuse the previous type check result when its inputs are unchanged
     type_warnings =
-      profile(module, profile, fn ->
-        Module.Types.warnings(module, file, attrs, definitions, no_warn_undefined, cache)
-      end)
+      if types? do
+        profile(module, profile, fn ->
+          Module.Types.warnings(module, file, attrs, definitions, no_warn_undefined, cache)
+        end)
+      else
+        []
+      end
 
     {warnings, errors} =
       type_warnings

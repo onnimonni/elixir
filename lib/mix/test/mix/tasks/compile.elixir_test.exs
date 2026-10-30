@@ -1985,6 +1985,76 @@ defmodule Mix.Tasks.Compile.ElixirTest do
     end)
   end
 
+  test "verify runtime dependents when only the body of a module changes" do
+    in_fixture("no_mixfile", fn ->
+      Mix.Project.push(MixTest.Case.Sample)
+
+      File.write!("lib/a.ex", """
+      defmodule A do
+        def path, do: "/a"
+      end
+      """)
+
+      File.write!("lib/b.ex", """
+      defmodule B do
+        @after_verify __MODULE__
+        def run, do: A.path() <> "!"
+        def __after_verify__(__MODULE__) do
+          if A.path() != "/a", do: IO.warn("BAD PATH", __ENV__)
+        end
+      end
+      """)
+
+      output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
+      refute output =~ "BAD PATH"
+      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+
+      # Same signatures, so B skips type checking but still runs @after_verify
+      File.write!("lib/a.ex", """
+      defmodule A do
+        def path, do: "/b"
+      end
+      """)
+
+      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
+
+      output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
+      assert output =~ "BAD PATH"
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+
+      # Signature changed, so B is type checked
+      File.write!("lib/a.ex", """
+      defmodule A do
+        def path, do: :b
+      end
+      """)
+
+      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
+
+      output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
+      assert output =~ "incompatible types"
+
+      # Same signatures, but B had warnings, so it is type checked again
+      File.write!("lib/a.ex", """
+      defmodule A do
+        @doc "The path"
+        def path, do: :b
+      end
+      """)
+
+      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
+
+      output =
+        capture_io(:stderr, fn ->
+          Mix.Tasks.Compile.Elixir.run(["--verbose", "--no-all-warnings"])
+        end)
+
+      assert output =~ "incompatible types"
+      assert output =~ "BAD PATH"
+    end)
+  end
+
   defmodule GitApp do
     def project do
       [

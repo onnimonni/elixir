@@ -26,7 +26,8 @@ defmodule Kernel.ParallelCompiler do
           each_long_verification: (module() -> term()) | (module(), pid() -> term()),
           each_module: (Path.t(), module(), binary() -> term()),
           each_cycle: (-> {:compile, [Path.t()], [Code.diagnostic(:warning)]}
-                          | {:runtime, [{module(), Path.t()}], [Code.diagnostic(:warning)]}),
+                          | {:runtime, [{module(), Path.t()} | {module(), Path.t(), boolean()}],
+                             [Code.diagnostic(:warning)]}),
           long_compilation_threshold: pos_integer(),
           long_verification_threshold: pos_integer(),
           verification: boolean(),
@@ -184,7 +185,8 @@ defmodule Kernel.ParallelCompiler do
       * `{:compile, modules, warnings}` - to continue compilation with a list of
         further module files to compile
       * `{:runtime, modules, warnings}` - to stop compilation and verify the list
-        of `{module, path}` pairs because dependent modules have changed
+        of `{module, path}` pairs because dependent modules have changed. A
+        `{module, path, false}` triplet skips type checking that module
 
     * `:long_compilation_threshold` - the timeout (in seconds) to check for files
       taking too long to compile. For each file that exceeds the threshold, the

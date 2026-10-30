@@ -5,12 +5,12 @@
 defmodule Mix.Compilers.Elixir do
   @moduledoc false
 
-  @manifest_vsn 39
+  @manifest_vsn 40
   @checkpoint_vsn 5
 
   import Record
 
-  defrecord :module, [:kind, :sources, :export, :recompile?, :timestamp]
+  defrecord :module, [:kind, :sources, :export, :recompile?, :timestamp, :checker]
 
   defrecord :source,
     size: 0,
@@ -218,6 +218,7 @@ defmodule Mix.Compilers.Elixir do
 
         state = %{
           modules: %{},
+          old_checkers: Map.new(all_modules, fn {mod, module(checker: c)} -> {mod, c} end),
           exports: exports,
           sources: sources,
           changed: [],
@@ -1140,8 +1141,14 @@ defmodule Mix.Compilers.Elixir do
           each_file: fn file, lexical ->
             compiler_call(parent, ref, {:each_file, file, lexical, verbose})
           end,
-          each_module: fn file, module, _binary ->
-            compiler_call(parent, ref, {:each_module, file, module, System.os_time(:second)})
+          each_module: fn file, module, binary ->
+            checker = checker_md5(binary)
+
+            compiler_call(
+              parent,
+              ref,
+              {:each_module, file, module, System.os_time(:second), checker}
+            )
           end,
           each_long_compilation: fn file, pid ->
             Mix.shell().info(
@@ -1198,7 +1205,7 @@ defmodule Mix.Compilers.Elixir do
         state = each_file(file, references, verbose, state, cwd)
         compiler_loop(ref, pid, state, cwd)
 
-      {^ref, {:each_module, file, module, timestamp}} ->
+      {^ref, {:each_module, file, module, timestamp, checker}} ->
         # Read the relevant module information and unblock the compiler
         kind = detect_kind(module)
         external = Module.get_attribute(module, :external_resource)
@@ -1208,6 +1215,8 @@ defmodule Mix.Compilers.Elixir do
 
         state =
           each_module(file, module, kind, external, new_export, recompile?, state, timestamp, cwd)
+
+        state = put_in(state.modules[module], module(state.modules[module], checker: checker))
 
         compiler_loop(ref, pid, state, cwd)
 
@@ -1299,17 +1308,36 @@ defmodule Mix.Compilers.Elixir do
         # fine because we only care about the keys.
         changed_modules = Map.merge(modules, stale_modules)
 
+        # Type checking a dependent only reads its own code and the checker chunks
+        # (exports and signatures) of the modules it calls. When a module was recompiled
+        # but its checker chunk is identical, its dependents' previous type check result
+        # is still valid, so we reuse it when it had no warnings. Behaviour checks and
+        # @after_verify callbacks always run, as they may call into the module.
+        signature_changed =
+          modules
+          |> Map.reject(fn {mod, module(checker: checker)} ->
+            checker != nil and Map.get(state.old_checkers, mod) == checker
+          end)
+          |> Map.merge(stale_modules)
+
         # Now we do a simple pass finding anything that directly depends on the modules that
         # changed. We don't need to compute a fixpoint, because now only the directly affected
         # matter.
         {sources, runtime_modules} =
           Enum.reduce(sources, {sources, []}, fn
             {source_path, source_entry}, {acc_sources, acc_modules} ->
-              source(export_references: export_refs, runtime_references: runtime_refs) =
-                source_entry
+              source(
+                export_references: export_refs,
+                runtime_references: runtime_refs,
+                runtime_warnings: runtime_warnings
+              ) = source_entry
 
               if has_any_key?(changed_modules, export_refs) or
                    has_any_key?(changed_modules, runtime_refs) do
+                types? =
+                  runtime_warnings != [] or has_any_key?(signature_changed, export_refs) or
+                    has_any_key?(signature_changed, runtime_refs)
+
                 acc_sources =
                   Map.replace!(
                     acc_sources,
@@ -1318,7 +1346,9 @@ defmodule Mix.Compilers.Elixir do
                   )
 
                 new_modules =
-                  Enum.reject(source(source_entry, :modules), &Map.has_key?(changed_modules, &1))
+                  for module <- source(source_entry, :modules),
+                      not Map.has_key?(changed_modules, module),
+                      do: {module, types?}
 
                 {acc_sources, new_modules ++ acc_modules}
               else
@@ -1327,10 +1357,22 @@ defmodule Mix.Compilers.Elixir do
           end)
 
         runtime_paths =
-          Enum.map(runtime_modules, &{&1, Path.join(dest, Atom.to_string(&1) <> ".beam")})
+          Enum.map(runtime_modules, fn {module, types?} ->
+            {module, Path.join(dest, Atom.to_string(module) <> ".beam"), types?}
+          end)
 
         state = %{state | sources: sources}
         {{:runtime, runtime_paths, []}, state}
+    end
+  end
+
+  # Runtime dependents only see a module through the type checker chunk
+  # (exports, their signatures and deprecations). When it is unchanged after a
+  # recompilation, the dependents do not need to be type checked again.
+  defp checker_md5(binary) do
+    case :beam_lib.chunks(binary, [~c"ExCk"]) do
+      {:ok, {_module, [{_, chunk}]}} -> :erlang.md5(chunk)
+      _ -> nil
     end
   end
 
