@@ -98,12 +98,24 @@ defmodule Mix.Compilers.Elixir do
     # dbg callback.
     compile_env_apps = deps_config_compile_env_apps(old_deps_config)
 
+    # If the project moved (git worktree, copy-on-write clone, restored CI cache),
+    # rewrite the old root in the debug chunks of the .beam files and only recompile
+    # the modules whose code or attributes captured the old root.
+    {relocated, relocated_stale} =
+      if Keyword.get(opts, :check_cwd, true) and Keyword.get(opts, :relocate, true) and
+           is_binary(old_cwd) and old_cwd != File.cwd!() and not is_nil(old_deps_config) and
+           old_cache_key == new_cache_key and !opts[:force] do
+        {true, relocate_modules(all_modules, dest, old_cwd, File.cwd!())}
+      else
+        {false, %{}}
+      end
+
     {force?, stale, new_deps_config} =
       cond do
         !!opts[:force] or is_nil(old_deps_config) or old_cache_key != new_cache_key ->
           {true, stale, deps_config(local_deps, opts)}
 
-        Keyword.get(opts, :check_cwd, true) and old_cwd != File.cwd!() ->
+        not relocated and Keyword.get(opts, :check_cwd, true) and old_cwd != File.cwd!() ->
           debug_recompile("current working directory has changed")
           {true, stale, deps_config(local_deps, opts)}
 
@@ -158,6 +170,8 @@ defmodule Mix.Compilers.Elixir do
 
     {stale_modules, stale_exports, all_local_exports, protocols_and_impls} =
       stale_local_deps(local_deps, manifest, stale, modified, all_local_exports)
+
+    stale_modules = Map.merge(stale_modules, relocated_stale)
 
     prev_paths = Map.keys(all_sources)
     removed = prev_paths -- all_paths
@@ -821,6 +835,135 @@ defmodule Mix.Compilers.Elixir do
       :code.delete(module)
     end
   end
+
+  ## Relocation
+
+  # These chunks only describe where the code came from (compile info with the
+  # source path, debug info, docs), so the old root can be rewritten in place.
+  # Any other chunk mentioning the old root (literals, atoms, attributes, line
+  # table) means the code captured it, for example through __DIR__, so the
+  # module is recompiled instead.
+  @relocatable_chunks [~c"CInf", ~c"Dbgi", ~c"Docs"]
+
+  defp relocate_modules(all_modules, dest, old_root, new_root) do
+    old_root_charlist = String.to_charlist(old_root)
+    roots = {old_root, old_root <> "/", old_root_charlist, String.to_charlist(new_root), new_root}
+
+    stale =
+      all_modules
+      |> Map.keys()
+      |> Task.async_stream(&relocate_module(&1, dest, roots),
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Enum.reduce(%{}, fn
+        {:ok, {:recompile, module}}, acc -> Map.put(acc, module, true)
+        {:ok, :ok}, acc -> acc
+      end)
+
+    debug_recompile(
+      "current working directory has changed, relocated #{map_size(all_modules) - map_size(stale)} " <>
+        "modules, #{map_size(stale)} captured the old directory"
+    )
+
+    stale
+  end
+
+  defp relocate_module(module, dest, {old_root, _, _, _, _} = roots) do
+    path = beam_path(dest, module)
+
+    with {:ok, binary} <- File.read(path),
+         {:ok, ^module, chunks} <- :beam_lib.all_chunks(binary),
+         false <- Enum.any?(chunks, &captures_root?(&1, old_root)) do
+      # Debug info is usually compressed, so decode instead of searching the bytes
+      new_chunks =
+        for {id, data} <- chunks do
+          if id in @relocatable_chunks do
+            term = :erlang.binary_to_term(data)
+
+            case relocate_term(term, roots) do
+              ^term -> {id, data}
+              # Keep the original encoding, the loader reads CInf uncompressed
+              new_term -> {id, :erlang.term_to_binary(new_term, encoding_opts(data))}
+            end
+          else
+            {id, data}
+          end
+        end
+
+      if new_chunks != chunks do
+        {:ok, new_binary} = :beam_lib.build_module(new_chunks)
+        {:ok, %{mtime: mtime}} = File.stat(path, time: :posix)
+        File.write!(path, new_binary)
+        File.touch!(path, mtime)
+      end
+
+      :ok
+    else
+      _ -> {:recompile, module}
+    end
+  end
+
+  defp encoding_opts(<<131, 80, _::binary>>), do: [:deterministic, :compressed]
+  defp encoding_opts(_), do: [:deterministic]
+
+  defp captures_root?({id, _data}, _old_root) when id in @relocatable_chunks, do: false
+
+  defp captures_root?({~c"LitT", <<0::32, data::binary>>}, old_root),
+    do: :binary.match(data, old_root) != :nomatch
+
+  defp captures_root?({~c"LitT", <<_size::32, compressed::binary>>}, old_root),
+    do: :binary.match(:zlib.uncompress(compressed), old_root) != :nomatch
+
+  defp captures_root?({_id, data}, old_root), do: :binary.match(data, old_root) != :nomatch
+
+  defp relocate_term(binary, {old_root, old_prefix, _, _, new_root}) when is_binary(binary) do
+    cond do
+      binary == old_root ->
+        new_root
+
+      String.starts_with?(binary, old_prefix) ->
+        new_root <>
+          binary_part(binary, byte_size(old_root), byte_size(binary) - byte_size(old_root))
+
+      true ->
+        binary
+    end
+  end
+
+  defp relocate_term([_ | _] = list, {_, _, old_charlist, new_charlist, _} = roots) do
+    case relocate_charlist(list, old_charlist) do
+      {:ok, rest} -> new_charlist ++ rest
+      :error -> relocate_list(list, roots)
+    end
+  end
+
+  defp relocate_term(tuple, roots) when is_tuple(tuple) do
+    tuple |> Tuple.to_list() |> Enum.map(&relocate_term(&1, roots)) |> List.to_tuple()
+  end
+
+  defp relocate_term(%{} = map, roots) do
+    # :maps instead of Map/Enum, as structs do not implement Enumerable
+    :maps.from_list(
+      for {key, value} <- :maps.to_list(map),
+          do: {relocate_term(key, roots), relocate_term(value, roots)}
+    )
+  end
+
+  defp relocate_term(other, _roots), do: other
+
+  # Returns the rest of the charlist when it is the old root or a path inside it
+  defp relocate_charlist([char | list], [char | old]), do: relocate_charlist(list, old)
+  defp relocate_charlist([], []), do: {:ok, []}
+  defp relocate_charlist([?/ | _] = rest, []), do: {:ok, rest}
+  defp relocate_charlist(_list, _old), do: :error
+
+  # Lists may be improper
+  defp relocate_list([head | tail], roots),
+    do: [relocate_term(head, roots) | relocate_list(tail, roots)]
+
+  defp relocate_list([], _roots), do: []
+  defp relocate_list(tail, roots), do: relocate_term(tail, roots)
 
   defp purge_modules_in_path(path) do
     with {:ok, beams} <- File.ls(path) do

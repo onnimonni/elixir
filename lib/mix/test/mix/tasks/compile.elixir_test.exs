@@ -133,6 +133,71 @@ defmodule Mix.Tasks.Compile.ElixirTest do
     end)
   end
 
+  test "relocates the project if cwd changes" do
+    in_fixture("no_mixfile", fn ->
+      File.write!("lib/c.ex", """
+      defmodule C do
+        def dir, do: __DIR__
+      end
+      """)
+
+      Mix.Project.push(MixTest.Case.Sample)
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == {:ok, []}
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      assert_received {:mix_shell, :info, ["Compiled lib/c.ex"]}
+      Mix.Project.pop()
+
+      old_cwd = File.cwd!()
+
+      in_tmp("relocated_cwd", fn ->
+        Mix.Project.push(MixTest.Case.Sample)
+        File.cp_r!(old_cwd, File.cwd!())
+        purge([A, B, C])
+        Mix.Task.clear()
+
+        # Only the module that captured the old directory is recompiled
+        assert {:ok, _} = Mix.Tasks.Compile.Elixir.run(["--verbose"])
+        assert_received {:mix_shell, :info, ["Compiled lib/c.ex"]}
+        refute_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+        purge([C])
+        {:module, C} = :code.load_abs(~c"_build/dev/lib/sample/ebin/Elixir.C")
+        assert C.dir() == Path.expand("lib")
+
+        # The others now point to the new directory
+        {:ok, {A, [compile_info: info]}} =
+          :beam_lib.chunks(~c"_build/dev/lib/sample/ebin/Elixir.A.beam", [:compile_info])
+
+        assert info[:source] == String.to_charlist(Path.expand("lib/a.ex"))
+
+        Mix.Task.clear()
+        assert {:noop, _} = Mix.Tasks.Compile.Elixir.run(["--verbose"])
+      end)
+    end)
+  end
+
+  test "recompiles project if cwd changes and --no-relocate is given" do
+    in_fixture("no_mixfile", fn ->
+      Mix.Project.push(MixTest.Case.Sample)
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == {:ok, []}
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+      Mix.Project.pop()
+
+      old_cwd = File.cwd!()
+
+      in_tmp("not_relocated_cwd", fn ->
+        Mix.Project.push(MixTest.Case.Sample)
+        File.cp_r!(old_cwd, File.cwd!())
+        purge([A, B])
+        Mix.Task.clear()
+
+        assert {:ok, _} = Mix.Tasks.Compile.Elixir.run(["--verbose", "--no-relocate"])
+        assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+        assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+      end)
+    end)
+  end
+
   test "recompiles files using Mix.Project if mix.exs changes" do
     in_fixture("no_mixfile", fn ->
       Mix.Project.push(MixTest.Case.Sample, __ENV__.file)

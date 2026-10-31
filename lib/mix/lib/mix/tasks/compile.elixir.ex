@@ -116,7 +116,8 @@ defmodule Mix.Tasks.Compile.Elixir do
     all_warnings: :boolean,
     verification: :boolean,
     tracer: :keep,
-    check_cwd: :boolean
+    check_cwd: :boolean,
+    relocate: :boolean
   ]
 
   @impl true
